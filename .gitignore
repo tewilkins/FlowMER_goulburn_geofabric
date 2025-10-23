@@ -47,3 +47,11 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Data directories (geofabric data can be large)
+data/
+output/
+
+# Keep directory structure with .gitkeep files
+!data/.gitkeep
+!output/.gitkeep
