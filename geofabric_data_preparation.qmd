@@ -1,0 +1,208 @@
+---
+title: "Extracting stream and catchment geometry data for the Goulburn River"
+author: "Thomas Wilkins"
+format: html
+editor: visual
+---
+
+```{r}
+#| label: setup
+#| echo: false
+#| message: false
+#| warning: false
+
+source("functions/misc_functions.R")
+
+load_packages(c(
+  "sf",
+  "dplyr",
+  "ggplot2",
+  "igraph"
+))
+
+# set path to geofabric data
+geofab_network_path <- "data/SH_Network_GDB/"
+geofab_catchments_path <- "data/HR_Catchments_GDB/"
+
+
+```
+
+## 1. Introduction
+
+This document contains R code to extract stream and catchment geometry data for the Goulburn River and related territories.
+Stream and catchment data was extracted from the Australian Hydrological Geospatial Fabric (Geofabric).
+
+There are two layers of interest in this dataset:
+
+1.  AHGFNetworkStream: contains stream network geometry and attributes
+2.  AHGFCatchment: contains catchment geometry and attributes
+
+### 1.1. Extracting streams connected to the Murray River outlet
+
+Initial exploration was done to identify all streams connected to the Murray River outlet, as the Goulburn River is a tributary of the Murray River.
+The most downstream point of the Murray River was identified as the Coorong Channel outlet to the Southern Ocean, near Goolwa, South Australia.
+
+```{r}
+#| label: extract_geofab_streams_data
+#| echo: true
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+
+st_layers(paste0(geofab_network_path, "SH_Network.gdb/"))
+
+# read in geofabric stream network data
+geofab_networkstream <- sf::st_read(
+  dsn = paste0(geofab_network_path, "SH_Network.gdb/"),
+  layer = "AHGFNetworkStream"
+)
+
+# Isolate most downstream point of the Murray River:
+murray_ol <- geofab_networkstream[geofab_networkstream$Name == "COORONG CHANNEL" & 
+                                    geofab_networkstream$NextDownID == -1, ] # -1 implies outlet
+murray_ol <- murray_ol[!is.na(murray_ol$NextDownID), ] 
+
+# Create edge list (upstream → downstream)
+edges <- geofab_networkstream %>%
+  st_drop_geometry() %>%
+  select(From_Node, To_Node, HydroID)
+
+# Create graph object of the stream network
+g <- graph_from_data_frame(edges, directed = TRUE)
+
+# Find all upstream HydroIDs of the Murray River outlet
+upstream_nodes <- subcomponent(g, as.character(murray_ol$To_Node), mode = "in")
+streams_murray_connected <- geofab_networkstream %>%
+  filter(From_Node %in% names(V(g))[upstream_nodes] |
+         To_Node %in% names(V(g))[upstream_nodes])
+
+# Compute shortest paths *upstream* (reverse direction)
+# Add distances to streams_murray_connected
+streams_murray_connected <- streams_murray_connected %>%
+  mutate(distance_to_murray_ol = st_distance(Shape, st_geometry(murray_ol)))
+  mutate(distance_to_murray_ol = as.numeric(distance_to_murray_ol)) # convert to numeric
+
+streams_murray_connected$d2ol <- as.numeric(streams_murray_connected$distance_to_murray_ol)
+
+# Identify confluences
+# A confluence is where two or more upstream segments flow into a single downstream segment
+# i.e., a To_Node with multiple From_Nodes
+streams_murray_connected$confluence <- 0
+to_node_counts <- as.data.frame(table(streams_murray_connected$To_Node))
+confluence_nodes <- to_node_counts$Var1[to_node_counts$Freq > 1]
+streams_murray_connected$confluence[streams_murray_connected$To_Node %in% confluence_nodes] <- 1
+streams_murray_confluences <- streams_murray_connected[streams_murray_connected$confluence == 1 & 
+                                                         streams_murray_connected$Name == " ", ]
+
+# Save streams_murray_connected for later use
+saveRDS(streams_murray_connected, "data/murray_networkstream.rds")
+
+
+```
+
+The following plot shows all streams connected to the Murray River outlet, overlaid on a map of Australia for verification.
+
+```{r}
+
+# Read murray stream network data:
+streams_murray_connected <- readRDS("data/murray_networkstream.rds")
+
+# Extract coordinates of the most downstream point of the Murray River (murray_ol)
+murray_ol <- streams_murray_connected[streams_murray_connected$Name == "COORONG CHANNEL" & 
+                                    streams_murray_connected$NextDownID == -1, ]
+
+murray_ol_geom <- st_geometry(murray_ol)[[1]]
+coords <- st_coordinates(murray_ol_geom)
+ds_point <- coords[nrow(coords), ]
+
+# Convert to sf POINT
+murray_ol_sf <- st_as_sf(data.frame(x = ds_point[1], y = ds_point[2]),
+                       coords = c("x", "y"),
+                       crs = st_crs(geofab_networkstream))
+
+
+# Plot streams_murray_connected overlaid on a map of Australia to verify
+australia <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+ggplot() +
+  geom_sf(data = australia, fill = "lightgrey") +
+  geom_sf(data = streams_murray_connected, color = "blue") +
+  # Plot a point for the downstream-most point on the Murray River (murray_ol):
+  geom_sf(data = murray_ol_sf, color = "red", size = 2) +
+  coord_sf(xlim = c(138, 155), ylim = c(-40, -25)) +
+  theme_minimal() +
+  labs(title = "Streams connected to the Murray River outlet")
+
+
+```
+
+### 1.2. Extracting catchments within the Murray-Darling Basin
+
+Catchments were derived from the Geofabric HR_Catchments geodatabase.
+
+```{r}
+#| label: extract_geofab_streams_data
+#| echo: true
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+st_layers(paste0(geofab_network_path, "SH_Network.gdb/"))
+
+
+
+```
+
+## Missing Stream names
+
+Approximately 60% of the stream segments in the Geofabric database have no stream name assigned.
+Correcting the whole Murray-Darling basin is beyond the scope of this document (for now), so I will focus on correcting the Goulburn River stream names.
+The Goulburn River has several segments in the Geofabric data, some of which are unnamed.
+We can identify these segments based on their proximity to known locations along the Goulburn River.
+Given that each stream has a downstream confluence to a distinct stream, and an upstream-most point, we can use these characteristics to identify the Goulburn River segments if a stream has at least one named component.
+Once this is achieved in the Goulburn River, it can be extended to the full Murray-Darling stream network.
+
+First, I need to find the downstream-most point of the Goulburn River catchment, which (I presume) is the confluence with the Murray River near Echuca, Victoria.
+
+```{r}
+#| label: goulburn_name_correction
+#| echo: true
+#| message: false
+#| warning: false
+#| results: 'hide'
+
+# Identify Goulburn River segments based on known named segments
+goulburn_streams <- streams_murray_connected[streams_murray_connected$Name %in% c("GOULBURN RIVER", "GOULBURN WEIR TO SHEPPARTON"),]
+
+# Just need one segment - most downstream segment is sufficient
+goulburn_segment <- goulburn_streams[which.min(goulburn_streams$d2ol), ]
+
+# find all upstream segments connected to the identified Goulburn River segment
+goulburn_ig <- subcomponent(g, as.character(goulburn_segment$From_Node), mode = "in")
+
+goulburn_us <- streams_murray_connected %>%
+  filter(From_Node %in% names(V(g))[goulburn_ig] |
+         To_Node %in% names(V(g))[goulburn_ig])
+
+
+# Plot streams_murray_connected overlaid on a map of Australia to verify
+australia <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+ggplot() +
+  geom_sf(data = australia, fill = "lightgrey") +
+  geom_sf(data = goulburn_us, color = "blue") +
+  # Plot a point for the downstream-most point on the Murray River (murray_ol):
+  # geom_sf(data = murray_ol_sf, color = "red", size = 2) +
+  coord_sf(xlim = c(143, 149), ylim = c(-39, -34)) +
+  theme_minimal() +
+  labs(title = "Streams connected to the Murray River outlet")
+
+
+
+# Find all downstream segments connected to the identified Goulburn River segment
+downstream_nodes <- subcomponent(g, as.character(goulburn_streams$To_Node), mode = "out")
+
+goulburn_ds <- streams_murray_connected %>%
+  filter(From_Node %in% names(V(g))[downstream_nodes] |
+         To_Node %in% names(V(g))[downstream_nodes])
+
+```
