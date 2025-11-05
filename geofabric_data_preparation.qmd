@@ -3,6 +3,7 @@ title: "Extracting stream and catchment geometry data for the Goulburn River"
 author: "Thomas Wilkins"
 format: html
 editor: visual
+bibliography: references.bib
 ---
 
 ```{r}
@@ -30,6 +31,8 @@ geofab_catchments_path <- "data/HR_Catchments_GDB/"
 ## 1. Introduction
 
 This document contains R code to extract stream and catchment geometry data for the Goulburn River and related territories.
+The purpose of this document is to provide a clear and reproducible method for obtaining the necessary spatial data for hydrological analysis and modelling, specifically for the Flow-MER project.
+
 Stream and catchment data was extracted from the Australian Hydrological Geospatial Fabric (Geofabric).
 
 There are two layers of interest in this dataset:
@@ -37,7 +40,9 @@ There are two layers of interest in this dataset:
 1.  AHGFNetworkStream: contains stream network geometry and attributes
 2.  AHGFCatchment: contains catchment geometry and attributes
 
-### 1.1. Extracting streams connected to the Murray River outlet
+## 2. Deriving a stream network for the Murray-Darling Basin, and Goulburn River and Northern Tributaries
+
+### 2.1. Extracting streams connected to the Murray River outlet
 
 Initial exploration was done to identify all streams connected to the Murray River outlet, as the Goulburn River is a tributary of the Murray River.
 The most downstream point of the Murray River was identified as the Coorong Channel outlet to the Southern Ocean, near Goolwa, South Australia.
@@ -153,7 +158,7 @@ ggplot() +
 
 ```
 
-### 1.2. Filtering streams within the Goulburn River and Northern Tributaries (GRANT) area
+### 2.2. Filtering streams within the Goulburn River and Northern Tributaries (GRANT) area
 
 For the Flow-MER project, we are interested in streams within the Goulburn River and Northern Tributaries (GRANT) area.
 This area includes the Goulburn River and its major tributaries: Loddon River, Broken Creek, Broken River, and Campaspe River systems.
@@ -228,7 +233,7 @@ There are 51 named streams within the Goulburn River and Northern Tributaries (G
 Many of these streams are smaller tributaries surrounding the Lake Eildon reservoir.
 The majority of stream segments (n) constitute the Goulburn River (n = 212), Loddon River (n = 107), Broken River (n = 70), Campaspe River (n = 77), and Holland (n = 28) systems.
 
-### 1.3. Extracting catchments within the Murray-Darling Basin
+### 2.3. Extracting catchments within the Murray-Darling Basin
 
 To extract the catchment boundary, we read in the AHGFCatchment layer from the Geofabric dataset and filter for catchments within the Goulburn basin.
 
@@ -244,29 +249,309 @@ Attempting to read in the entire AHGFCatchment layer may lead to memory issues i
 #| eval: false
 
 # Explore available layers in the geofabric geodatabase:
-st_layers(paste0(geofab_network_path, "SH_Network.gdb/"))
+st_layers(paste0(geofab_network_path, "SH_Network.gdb/")) # AHGFCatchment
 
+# AHGFCatchment layer contains catchment geometry and attributes
 # Inspect field names in AHGFCatchment layer
 cat_head <- st_read(
   dsn = paste0(geofab_network_path, "SH_Network.gdb/"),
   layer = "AHGFCatchment",
-  query = "SELECT * FROM AHGFCatchment LIMIT 5"
+  query = "SELECT * FROM AHGFCatchment LIMIT 250"
 )
 
 # names(cat_head)
 # Column headers of interest:
-# [1] "AHGFCatchmentID"      "AHGFCatchmentName"    "HydroID"
+# [1] "StreamName"      "HydroID"    "NextDownID"
 
 # Read in GRANT streams to get list of catchment names:
 goulburn_networkstream <- readRDS("data/goulburn_networkstream.rds")
+ID_list <- paste0("'", goulburn_networkstream$HydroID[1:3], "'", collapse = ", ")
+# Create SQL query to filter catchments by HydroID:
+query_string <- paste0("SELECT * FROM AHGFCatchment WHERE HydroID IN (", ID_list, ")")
+
 
 # read in geofabric catchment data for the goulburn basin:
 cat_sf <- sf::st_read(
   dsn = paste0(geofab_network_path, "SH_Network.gdb/"),
   layer = "AHGFCatchment",
-  query = paste0("SELECT * FROM AHGFCatchment WHERE AHGFCatchmentName IN ", unique(goulburn_networkstream$Name))
+  query = "SELECT * FROM AHGFCatchment WHERE StreamName NOT IN ('', ' ')",
+  geometry_column = "Shape"
 )
+
+grant_cat_sf <- cat_sf[cat_sf$HydroID %in% goulburn_networkstream$DrainID, ]
+
+saveRDS(grant_cat_sf, "data/goulburn_catchments.rds")
+
+# Plot catchments to verify
+australia <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+ggplot() +
+  geom_sf(data = australia, fill = "grey90") +
+  geom_sf(data = grant_cat_sf, fill = "lightblue", color = "blue3", alpha = 0.5) +
+  coord_sf(xlim = c(142, 149), ylim = c(-39, -34)) +
+  theme_minimal() +
+  labs(title = "Catchments within the Goulburn River and Northern Tributaries (GRANT) area")
+
 
 
 
 ```
+
+## 3. Creating a naming convention for each stream segment
+
+To facilitate easier identification of stream segments, I have created a naming convention that combines the stream name with a unique segment identifier.
+This is based on the d2ol and the name of the stream relating to each segment.
+This will help in future analysis and reporting by providing an interpretable identifier for each segment, is robust to automatic additions of new sites, and is also relatable to the Geofabric dataset.
+
+The convention uses the following logic to ensure uniqueness and interpretation:
+
+1 - A three-letter initialism of the stream name (e.g., GOR for Goulburn River), 2 - A single integer corresponding to the Flow-MER river system (e.g., 9 for Goulburn River and Northern Tributaries),\
+3 - An integer recording its d2ol rounded to the nearest meter (e.g., 12543 for a segment 12.543 km from the outlet),
+
+The following code implements this naming convention for each stream segment in the Goulburn network and checks for uniqueness across all stream segments.
+
+### 3.1. 3-letter initialism creation
+
+This can be done for every named stream in the Geofabric for consistency.
+The following code creates a unique 3-letter initialism for each stream name in the Murray-Darling network (or at least attempts to):
+
+```{r}
+#| label: create_stream_naming_convention
+#| echo: true
+#| message: false
+#| warning: false
+#| results: 'hide'
+#| eval: true
+
+# Read in Goulburn stream network data:
+#goulburn_networkstream <- readRDS("data/goulburn_networkstream.rds")
+
+# Create a new column 'sitecode' combining stream name and a unique segment identifier
+#goulburn_networkstream$sitecode <- NA
+
+#names <- unique(goulburn_networkstream$Name)
+#names_table <- as.data.frame(table(goulburn_networkstream$Name))
+
+murray_networkstream <- readRDS("data/murray_networkstream_named.rds")
+names_table <- as.data.frame(table(murray_networkstream$Name))
+
+# Find number of words per stream name:
+names_table$word_count <- sapply(as.character(names_table$Var1), function(x) {
+  length(unlist(strsplit(x, " ")))
+})
+
+# Function to create a three-letter initialism from stream name:
+create_initialism <- function(str_name, name_bank) {
+  
+  # Remove all non-letter and non-space characters from stream name:
+  str_name <- gsub("[^A-Za-z ]", "", str_name)
+
+  # Split stream name:  
+  str_name_split <- unlist(strsplit(str_name, " "))
+  init_repeated = TRUE
+  init_attempt = 1
+  circuit_breaker = 50000
+  exhaustive_sort_start = 26*26
+  char1 <- 1
+  char2 <- 1
+  char3 <- 1
+  common_words <- c("THE", "OF", "AND", "CREEK", "BROOK", "STREAM", "CHANNEL", "GULLY", "WATERWAY", "WATERCOURSE", "BRANCH")
+  
+  while (init_repeated == TRUE){
+    
+    # Pre-filter names with four or more words:
+    if (length(str_name_split) >= 4) {
+      # Remove common words like "THE", "OF", "AND":
+      str_name_split <- str_name_split[!toupper(str_name_split) %in% common_words]
+    }
+    
+    ### 1. For names with one word:
+    if (length(str_name_split) == 1) {
+    
+      # Take first two letters of the name, then attempt to take a third letter of the name:
+      initials <- c(substr(str_name_split[1], 1, 2), substr(str_name_split[1], 2 + init_attempt, 2 + init_attempt))
+      initialism <- toupper(paste(initials, collapse = ""))
+    }
+    
+    ### 2. For names with two words:
+    if (length(str_name_split) == 2) {
+    
+      # Name creeks (with more than 3 letters in its name) differently to rivers:
+      if (str_name_split[2] == "CREEK" & nchar(str_name_split[1]) > 3){
+
+        # Take first two letters of first word, then attempt to take a third letter of the first word:
+        initials <- c(substr(str_name_split[1], 1, 1), substr(str_name_split[1], 1 + init_attempt, 2 + init_attempt))
+        initialism <- toupper(paste(initials, collapse = ""))
+      } else {
+      
+        # Take first two letters of first word and first letter of second word:
+        initials <- c(substr(str_name_split[1], 1, 1), substr(str_name_split[1], 1 + init_attempt, 1 + init_attempt), substr(str_name_split[2], 1, 1))
+        initialism <- toupper(paste(initials, collapse = ""))
+      }
+    }
+  
+    ### 3. For names with three or more words:
+    if (length(str_name_split) == 3) {
+    
+      # Take first letter of each word:
+      initials <- c(substr(str_name_split[1], 1, 1), substr(str_name_split[2], 1 + init_attempt, 1 + init_attempt), substr(str_name_split[3], 1, 1))
+      initialism <- toupper(paste(initials, collapse = ""))
+    }  
+    
+    ### --- Error handling
+    
+    # If the initialism only has 1 character, add different letters to the end:
+    if (nchar(initialism) == 1){
+      initials <- c(initialism, LETTERS[char2], LETTERS[char3])
+      initialism <- toupper(paste(initials, collapse = ""))
+    }
+    
+    # If the initialism only has 2 characters, add a different letter to the end:
+    if (nchar(initialism) == 2){
+      initials <- c(initialism, LETTERS[char3])
+      initialism <- toupper(paste(initials, collapse = ""))
+    }
+    
+    # If the initialism has more than 3 characters, truncate to 3 characters:
+    if (nchar(initialism) > 3){
+      initialism <- substr(initialism, 1, 3)
+    }
+    
+    ### If everything has failed so far, force exhaustive sort:
+    if (init_attempt > exhaustive_sort_start){
+      initials <- LETTERS[c(char1, char2, char3)]
+      initialism <- toupper(paste(initials, collapse = ""))
+    }
+    
+    ### 4. Check if initialism already exists in name bank:
+    if (initialism %in% name_bank$initialism) {
+      
+      # Stop if circuit breaker is reached:
+      if (init_attempt >= circuit_breaker) {
+        stop(paste("Circuit breaker triggered for stream name:", str_name, 
+                   "after", circuit_breaker*2, "attempts to create a unique initialism."))
+      }
+      
+      # Add attempt counter:
+      init_attempt <- init_attempt + 1
+      
+      # Reset char if attempt 676 reached (i.e., ZZ):
+      if (init_attempt == exhaustive_sort_start){
+        # Declare fully randomised attempt:
+        print(paste("Exceeded", exhaustive_sort_start, "attempts for stream name:", str_name, 
+                      "- forcing exhaustive sort."))
+        char2 <- 1
+        char3 <- 1
+      }
+      
+      char3 <- char3 + 1
+      if (char3 > 26){
+        char3 <- 1
+        char2 <- char2 + 1
+      }
+      if (char2 > 26){
+        char2 <- 1
+        char1 <- char1 + 1
+      }
+      if (char1 > 26){
+        stop(paste("Unable to sort:", str_name))
+      }
+      # print(paste("Initialism", initialism, "already exists in name bank, trying again..."))
+    } else {
+      
+      # Switch off repeater
+      init_repeated = FALSE
+      print(paste("Initialism", initialism, "applied to", str_name, "."))
+      init_attempt <- 1
+    }
+  }
+  return(initialism)
+}
+
+# Initialise a dataframe to store initialisms recursively (i.e., is called within the create_initialism() function):
+name_bank <- data.frame(
+  stream_name = character(),
+  initialism = character(),
+  stringsAsFactors = FALSE
+)
+
+for (i in 1:nrow(names_table)) {
+  stream_name <- as.character(names_table$Var1[i])
+  initialism <- create_initialism(as.character(names_table$Var1[i]), name_bank = name_bank)
+  
+  # Add to name bank:
+  name_bank <- rbind(name_bank, data.frame(
+    stream_name = stream_name,
+    initialism = initialism,
+    stringsAsFactors = FALSE
+  ))
+}
+
+# Check that every initial is unique:
+length(unique(name_bank$initialism)) == length(name_bank$initialism) # 0
+
+# Check that all stream names have an initialism with three characters:
+length(name_bank$initialism[nchar(name_bank$initialism) != 3]) # 0
+
+# Check that all stream initials are letters:
+length(name_bank$stream_name[which(!grepl("^[A-Z]{3}$", name_bank$initialism))]) # 0
+
+# All good!
+# Write to file
+
+write.csv(name_bank, "data/murray_stream_name_initialisms.csv", row.names = FALSE)
+
+```
+
+### 3.2. Applying the naming convention to Goulburn stream segments
+
+The final sitecode for each stream segment combines the 3-letter initialism, the Flow-MER river system code (9 for Goulburn River and Northern Tributaries), and the d2ol rounded to the nearest meter, all separated by a hyphen ('-').
+This convention requires that each stream segment is at least 1m apart to ensure uniqueness.
+The following code applies the naming convention to each stream segment in the Goulburn network:
+
+```{r}
+#| label: apply_stream_naming_convention
+#| echo: true
+#| message: false
+#| warning: false
+#| results: 'hide'
+#| eval: true
+
+# Read in Goulburn stream network data:
+goulburn_networkstream <- readRDS("data/goulburn_networkstream.rds")
+goulburn_catchments <- readRDS("data/goulburn_catchments.rds")
+name_bank <- read.csv("data/murray_stream_name_initialisms.csv")
+
+# Merge name_bank with goulburn_networkstream to get initialisms:
+goulburn_networkstream$sitecode <- NA
+
+for (i in 1:nrow(goulburn_networkstream)) {
+  stream_name <- goulburn_networkstream$Name[i]
+  initialism <- name_bank$initialism[name_bank$stream_name == stream_name]
+  
+  # Create sitecode:
+  d2ol_rounded <- round(goulburn_networkstream$d2ol[i])
+  sitecode <- paste0(initialism, "-9-", d2ol_rounded)
+  
+  goulburn_networkstream$sitecode[i] <- sitecode
+}
+
+# Check for uniqueness of sitecodes:
+length(unique(goulburn_networkstream$sitecode)) == nrow(goulburn_networkstream) # TRUE
+
+# Merge geometries for sites less than 1m apart (in base R):
+goulburn_networkstream <- goulburn_networkstream[order(goulburn_networkstream$d2ol, decreasing = TRUE),]
+goulburn_networkstream_agg <- aggregate(goulburn_networkstream["sitecode"], by = list(goulburn_networkstream$sitecode), FUN = function(x) x[1], do_union = TRUE)
+
+# drop sf from goulburn_networkstream
+goulburn_networkstream <- st_set_geometry(goulburn_networkstream, NULL)
+class(goulburn_networkstream) <- "data.frame"
+
+# Merge goulburn_networkstream onto goulburn_networkstream_agg to get other attributes back:
+goulburn_networkstream_merge <- merge(goulburn_networkstream_agg, goulburn_networkstream, by = "sitecode", all.x = TRUE)
+
+# Merge catchment geometries based on sitecode:
+
+
+```
+
+## 4. References
